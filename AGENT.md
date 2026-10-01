@@ -47,6 +47,10 @@ When designing or modifying the schema, avoid these common mistakes:
 - Choose the correct Route Handler runtime — Edge for simple tasks, Node.js only when actually needed
 - Always set a correct `sizes` attribute on responsive `next/image` usage
 
+
+## deploy features on github
+after finishing any feature, deploy the changes to github
+
 ## Working Style
 
 When asked to implement a feature, prioritize logic, security, and billing correctness over UI implementation details — assume Claude Code will handle page/component creation directly once the underlying logic and data flow are correct.
