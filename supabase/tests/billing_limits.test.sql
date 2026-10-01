@@ -20,7 +20,20 @@ insert into public.tenants (id, name, stripe_customer_id) values
   ('00000000-0000-0000-0000-00000000000d', 'D no plan', 'cus_D'),
   ('00000000-0000-0000-0000-00000000000e', 'E growth',  'cus_E'),
   ('00000000-0000-0000-0000-00000000000f', 'F unpaid',  'cus_F'),
-  ('00000000-0000-0000-0000-000000000010', 'G trial',   'cus_G');
+  ('00000000-0000-0000-0000-000000000010', 'G trial',   'cus_G'),
+  ('00000000-0000-0000-0000-000000000011', 'H dunning', 'cus_H');
+
+-- Webhook-style call: ticket (p_seq) taken before the Stripe fetch.
+create function pg_temp.sync(
+  p_event text, p_seq bigint, p_cus text, p_sub text, p_price text,
+  p_status public.subscription_status, p_paid_at timestamptz default null,
+  p_type text default 'customer.subscription.updated'
+) returns text language sql as $f$
+  select public.apply_subscription_state(
+    p_event_id => p_event, p_event_type => p_type, p_sync_seq => p_seq,
+    p_customer_id => p_cus, p_subscription_id => p_sub, p_price_id => p_price,
+    p_status => p_status, p_payment_confirmed_at => p_paid_at)
+$f$;
 
 select lives_ok($$
   select public.sync_plan_prices('[
@@ -45,64 +58,104 @@ select is(
 );
 
 -- Subscriptions via the webhook RPC (invoice.paid = verified payment)
-select is(public.apply_subscription_state('evt_A1', 'invoice.paid', '2026-09-01T00:00:00Z', 'cus_A', 'sub_A', 'price_test_starter', 'active', '2026-10-01T00:00:00Z', false, '2026-09-01T00:00:00Z'), 'applied', 'A pays for starter');
-select is(public.apply_subscription_state('evt_B1', 'invoice.paid', '2026-09-01T00:00:00Z', 'cus_B', 'sub_B', 'price_test_growth',  'active', '2026-10-01T00:00:00Z', false, '2026-09-01T00:00:00Z'), 'applied', 'B pays for grandfathered growth price');
-select is(public.apply_subscription_state('evt_C1', 'invoice.paid', '2026-09-01T00:00:00Z', 'cus_C', 'sub_C', 'price_test_agency',  'active', '2026-10-01T00:00:00Z', false, '2026-09-01T00:00:00Z'), 'applied', 'C pays for agency');
-select is(public.apply_subscription_state('evt_E1', 'invoice.paid', '2026-09-01T00:00:00Z', 'cus_E', 'sub_E', 'price_test_growth_v2', 'active', '2026-10-01T00:00:00Z', false, '2026-09-01T00:00:00Z'), 'applied', 'E pays for growth');
+select is(pg_temp.sync('evt_A1', 100, 'cus_A', 'sub_A', 'price_test_starter',   'active', '2026-09-01', 'invoice.paid'), 'applied', 'A pays for starter');
+select is(pg_temp.sync('evt_B1', 101, 'cus_B', 'sub_B', 'price_test_growth',    'active', '2026-09-01', 'invoice.paid'), 'applied', 'B pays for grandfathered growth price');
+select is(pg_temp.sync('evt_C1', 102, 'cus_C', 'sub_C', 'price_test_agency',    'active', '2026-09-01', 'invoice.paid'), 'applied', 'C pays for agency');
+select is(pg_temp.sync('evt_E1', 103, 'cus_E', 'sub_E', 'price_test_growth_v2', 'active', '2026-09-01', 'invoice.paid'), 'applied', 'E pays for growth');
 
 -- ---------------------------------------------------------------------------
 -- Payment gate: no plan access without a confirmed payment
 -- ---------------------------------------------------------------------------
-select is(public.apply_subscription_state('evt_F1', 'customer.subscription.created', '2026-09-05T00:00:00Z', 'cus_F', 'sub_F', 'price_test_agency', 'incomplete', null, false), 'applied', 'F: checkout started, payment pending');
-select is(public.apply_subscription_state('evt_F2', 'customer.subscription.updated', '2026-09-05T00:01:00Z', 'cus_F', 'sub_F', 'price_test_agency', 'active', null, false), 'applied', 'F: status active, invoice.paid not received yet');
+select is(pg_temp.sync('evt_F1', 200, 'cus_F', 'sub_F', 'price_test_agency', 'incomplete', null, 'customer.subscription.created'), 'applied', 'F: checkout started, payment pending');
+select is(pg_temp.sync('evt_F2', 202, 'cus_F', 'sub_F', 'price_test_agency', 'active'), 'applied', 'F: status active, invoice.paid not received yet');
 select ok(not private.has_feature('00000000-0000-0000-0000-00000000000f', 'white_label'), 'active but unpaid: no features');
 select throws_ok($$ select private.consume_quota('00000000-0000-0000-0000-00000000000f', 'active_clients') $$, 'PT402', null, 'active but unpaid: read-only');
 select is((select effective_plan::text from public.tenant_entitlements where tenant_id = '00000000-0000-0000-0000-00000000000f' and metric = 'team_seats'), null, 'active but unpaid: no effective plan');
 
--- invoice.paid delivered late (older than the last applied event): the stale
--- snapshot is skipped but the payment is still recorded.
-select is(public.apply_subscription_state('evt_F3', 'invoice.paid', '2026-09-05T00:00:30Z', 'cus_F', 'sub_F', 'price_test_agency', 'active', null, false, '2026-09-05T00:00:30Z'), 'payment_confirmed', 'late invoice.paid still confirms payment');
+-- invoice.paid committed after a newer snapshot: the stale snapshot is
+-- skipped but the payment is still recorded.
+select is(pg_temp.sync('evt_F3', 201, 'cus_F', 'sub_F', 'price_test_agency', 'active', '2026-09-05', 'invoice.paid'), 'payment_confirmed', 'late invoice.paid still confirms payment');
 select ok(private.has_feature('00000000-0000-0000-0000-00000000000f', 'white_label'), 'paid: agency features unlocked');
-select is(public.apply_subscription_state('evt_F3', 'invoice.paid', '2026-09-05T00:00:30Z', 'cus_F', 'sub_F', 'price_test_agency', 'active', null, false, '2026-09-05T00:00:30Z'), 'duplicate', 'redelivered invoice.paid is a no-op');
+select is(pg_temp.sync('evt_F3', 201, 'cus_F', 'sub_F', 'price_test_agency', 'active', '2026-09-05', 'invoice.paid'), 'duplicate', 'redelivered invoice.paid is a no-op');
 select is((select count(*)::int from public.stripe_webhook_events where event_id = 'evt_F3'), 1, 'event recorded exactly once');
 
-select is(public.apply_subscription_state('evt_F4', 'customer.subscription.updated', '2026-09-06T00:00:00Z', 'cus_F', 'sub_F', 'price_test_agency', 'active', null, false), 'applied', 'later subscription.updated without payment info');
+select is(pg_temp.sync('evt_F4', 210, 'cus_F', 'sub_F', 'price_test_agency', 'active'), 'applied', 'later subscription.updated without payment info');
 select isnt((select payment_confirmed_at from public.tenant_subscriptions where tenant_id = '00000000-0000-0000-0000-00000000000f'), null, 'confirmation survives later updates');
 
-select is(public.apply_subscription_state('evt_F5', 'customer.subscription.updated', '2026-09-07T00:00:00Z', 'cus_F', 'sub_F', 'price_test_agency', 'past_due', null, false), 'applied', 'renewal payment failing');
+select is(pg_temp.sync('evt_F5', 220, 'cus_F', 'sub_F', 'price_test_agency', 'past_due'), 'applied', 'renewal payment failing');
 select ok(private.has_feature('00000000-0000-0000-0000-00000000000f', 'white_label'), 'past_due after a confirmed payment keeps access (retry window)');
-select is(public.apply_subscription_state('evt_F6', 'customer.subscription.updated', '2026-09-20T00:00:00Z', 'cus_F', 'sub_F', 'price_test_agency', 'unpaid', null, false), 'applied', 'retries exhausted');
+select is(pg_temp.sync('evt_F6', 230, 'cus_F', 'sub_F', 'price_test_agency', 'unpaid'), 'applied', 'retries exhausted (mark-unpaid setting)');
 select ok(not private.has_feature('00000000-0000-0000-0000-00000000000f', 'white_label'), 'unpaid: access removed');
 
 -- New subscription for the same tenant starts unconfirmed.
-select is(public.apply_subscription_state('evt_F7', 'customer.subscription.created', '2026-09-21T00:00:00Z', 'cus_F', 'sub_F2', 'price_test_starter', 'active', null, false), 'applied', 'F starts a new subscription');
+select is(pg_temp.sync('evt_F7', 240, 'cus_F', 'sub_F2', 'price_test_starter', 'active', null, 'customer.subscription.created'), 'applied', 'F starts a new subscription');
 select is((select payment_confirmed_at from public.tenant_subscriptions where tenant_id = '00000000-0000-0000-0000-00000000000f'), null, 'confirmation does not carry over to a new subscription');
 
 -- Trials never grant access, even if a confirmation were recorded.
-select is(public.apply_subscription_state('evt_G1', 'invoice.paid', '2026-09-01T00:00:00Z', 'cus_G', 'sub_G', 'price_test_agency', 'trialing', null, false, '2026-09-01T00:00:00Z'), 'applied', 'G trialing');
+select is(pg_temp.sync('evt_G1', 100, 'cus_G', 'sub_G', 'price_test_agency', 'trialing', '2026-09-01', 'invoice.paid'), 'applied', 'G trialing');
 select ok(not private.has_feature('00000000-0000-0000-0000-000000000010', 'online_payments'), 'trialing: no access');
 
--- A second paid subscription replacing a paid one is flagged for refund.
-select is(public.apply_subscription_state('evt_E_dup', 'invoice.paid', '2026-09-02T00:00:00Z', 'cus_E', 'sub_E_dup', 'price_test_growth_v2', 'active', null, false, '2026-09-02T00:00:00Z'), 'applied_replaced_live_subscription', 'double paid subscription is flagged');
-select is(public.apply_subscription_state('evt_E_back', 'invoice.paid', '2026-09-02T00:00:01Z', 'cus_E', 'sub_E', 'price_test_growth_v2', 'active', null, false, '2026-09-01T00:00:00Z'), 'applied_replaced_live_subscription', 'restore E to its original subscription');
+-- Two paid subscriptions at once are reported whichever one wins.
+select is(pg_temp.sync('evt_E_dup', 300, 'cus_E', 'sub_E_dup', 'price_test_growth_v2', 'active', '2026-09-02', 'invoice.paid'), 'applied_replaced_live_subscription', 'double paid subscription is flagged');
+select is(pg_temp.sync('evt_E_back', 301, 'cus_E', 'sub_E', 'price_test_growth_v2', 'active', '2026-09-01', 'invoice.paid'), 'applied_replaced_live_subscription', 'restore E to its original subscription');
+select is(pg_temp.sync('evt_E_dup2', 250, 'cus_E', 'sub_E_dup', 'price_test_growth_v2', 'active', '2026-09-02', 'invoice.paid'), 'ignored_duplicate_live_subscription', 'older paid duplicate is flagged but not applied');
+select is((select stripe_subscription_id from public.tenant_subscriptions where tenant_id = '00000000-0000-0000-0000-00000000000e'), 'sub_E', 'E keeps its original subscription');
+
+-- ---------------------------------------------------------------------------
+-- Revenue Recovery mirror: past_due while retrying, then canceled
+-- (Dashboard: cancel the subscription, leave the invoice past-due)
+-- ---------------------------------------------------------------------------
+select is(pg_temp.sync('evt_H1', 600, 'cus_H', 'sub_H2', 'price_test_growth_v2', 'incomplete', null, 'customer.subscription.created'), 'applied', 'H: new subscription pending');
+select is(pg_temp.sync('evt_H0', 601, 'cus_H', 'sub_H1', 'price_test_growth_v2', 'canceled', null, 'customer.subscription.deleted'), 'ignored_other_subscription', 'an old canceled subscription never replaces a pending one');
+select is(pg_temp.sync('evt_H2', 610, 'cus_H', 'sub_H2', 'price_test_growth_v2', 'active', '2026-09-10', 'invoice.paid'), 'applied', 'H pays');
+select is(public.apply_subscription_state(
+  p_event_id => 'evt_H3', p_event_type => 'invoice.payment_failed', p_sync_seq => 620,
+  p_customer_id => 'cus_H', p_subscription_id => 'sub_H2', p_price_id => 'price_test_growth_v2',
+  p_status => 'past_due', p_current_period_start => '2026-10-10', p_current_period_end => '2026-11-10',
+  p_latest_invoice_id => 'in_H_renewal', p_latest_invoice_status => 'open',
+  p_next_payment_attempt => '2026-10-13'), 'applied', 'H renewal fails, Stripe schedules a retry');
+select is(
+  (select row(status, latest_invoice_id, latest_invoice_status, next_payment_attempt, current_period_end)::text
+   from public.tenant_subscriptions where tenant_id = '00000000-0000-0000-0000-000000000011'),
+  (select row('past_due'::public.subscription_status, 'in_H_renewal', 'open'::public.stripe_invoice_status, '2026-10-13'::timestamptz, '2026-11-10'::timestamptz)::text),
+  'dunning state mirrored');
+select ok(private.has_feature('00000000-0000-0000-0000-000000000011', 'recurring_invoices'), 'past_due: access kept during retries');
+-- Same-second events: a snapshot fetched earlier but committed later is stale.
+select is(pg_temp.sync('evt_H4', 615, 'cus_H', 'sub_H2', 'price_test_growth_v2', 'active'), 'stale', 'earlier-ticket snapshot cannot overwrite a newer one');
+select is(public.apply_subscription_state(
+  p_event_id => 'evt_H5', p_event_type => 'customer.subscription.deleted', p_sync_seq => 630,
+  p_customer_id => 'cus_H', p_subscription_id => 'sub_H2', p_price_id => 'price_test_growth_v2',
+  p_status => 'canceled', p_canceled_at => '2026-10-24', p_ended_at => '2026-10-24',
+  p_latest_invoice_id => 'in_H_renewal', p_latest_invoice_status => 'open'), 'applied', 'all retries failed: Stripe cancels');
+select ok(not private.has_feature('00000000-0000-0000-0000-000000000011', 'recurring_invoices'), 'canceled after failed retries: access removed');
+select is((select latest_invoice_status::text from public.tenant_subscriptions where tenant_id = '00000000-0000-0000-0000-000000000011'), 'open', 'invoice left past-due');
+select is(pg_temp.sync('evt_H6', 640, 'cus_H', 'sub_H2', 'price_test_growth_v2', 'canceled', '2026-10-30', 'invoice.paid'), 'applied', 'customer pays the old invoice later');
+select ok(not private.has_feature('00000000-0000-0000-0000-000000000011', 'recurring_invoices'), 'paying a canceled subscription does not restore access');
 
 -- ---------------------------------------------------------------------------
 -- Webhook idempotency / ordering
 -- ---------------------------------------------------------------------------
-select is(public.apply_subscription_state('evt_A1', 'customer.subscription.created', '2026-09-01T00:00:00Z', 'cus_A', 'sub_A', 'price_test_agency', 'active', null, false), 'duplicate', 'replayed event is a no-op');
+select is(pg_temp.sync('evt_A1', 900, 'cus_A', 'sub_A', 'price_test_agency', 'active', null, 'customer.subscription.created'), 'duplicate', 'replayed event is a no-op');
 select is((select plan_code::text from public.tenant_subscriptions where tenant_id = '00000000-0000-0000-0000-00000000000a'), 'starter', 'duplicate did not change plan');
 
-select is(public.apply_subscription_state('evt_A0', 'customer.subscription.updated', '2026-08-01T00:00:00Z', 'cus_A', 'sub_A', 'price_test_agency', 'active', null, false), 'stale', 'older event is skipped');
+select is(pg_temp.sync('evt_A0', 50, 'cus_A', 'sub_A', 'price_test_agency', 'active'), 'stale', 'older snapshot is skipped');
 
-select is(public.apply_subscription_state('evt_A_other', 'customer.subscription.deleted', '2026-09-02T00:00:00Z', 'cus_A', 'sub_A_dup', 'price_test_starter', 'canceled', null, false), 'ignored_other_subscription', 'dead secondary subscription does not clobber live one');
+select is(pg_temp.sync('evt_A_other', 400, 'cus_A', 'sub_A_dup', 'price_test_starter', 'canceled', null, 'customer.subscription.deleted'), 'ignored_other_subscription', 'dead secondary subscription does not clobber live one');
+
+-- Reconciliation: no event id, no ledger row.
+select is(pg_temp.sync(null, 410, 'cus_A', 'sub_A', 'price_test_starter', 'active', null, 'reconcile'), 'applied', 'reconciliation snapshot applies');
+select is((select count(*)::int from public.stripe_webhook_events where type = 'reconcile'), 0, 'reconciliation is not recorded as an event');
+
+select throws_ok($$ select pg_temp.sync('evt_no_seq', null, 'cus_A', 'sub_A', 'price_test_starter', 'active') $$, 'P0001', null, 'a sync ticket is required');
+select ok(public.stripe_sync_ticket() > 0, 'tickets are issued');
 
 select throws_ok($$
-  select public.apply_subscription_state('evt_bad_price', 'customer.subscription.updated', '2026-09-03T00:00:00Z', 'cus_A', 'sub_A', 'price_unknown', 'active', null, false)
+  select pg_temp.sync('evt_bad_price', 420, 'cus_A', 'sub_A', 'price_unknown', 'active')
 $$, 'P0001', null, 'unmapped price raises (Stripe will retry)');
 select is((select count(*)::int from public.stripe_webhook_events where event_id = 'evt_bad_price'), 0, 'failed event is not recorded as processed');
 
 select throws_ok($$
-  select public.apply_subscription_state('evt_bad_cus', 'customer.subscription.updated', '2026-09-03T00:00:00Z', 'cus_nobody', 'sub_X', 'price_test_starter', 'active', null, false)
+  select pg_temp.sync('evt_bad_cus', 420, 'cus_nobody', 'sub_X', 'price_test_starter', 'active')
 $$, 'P0001', null, 'unknown customer raises');
 
 select throws_ok($$
@@ -159,7 +212,7 @@ select throws_ok($$ select private.consume_quota('00000000-0000-0000-0000-000000
 -- ---------------------------------------------------------------------------
 -- Downgrade: keep data, block new
 -- ---------------------------------------------------------------------------
-select is(public.apply_subscription_state('evt_B2', 'customer.subscription.updated', '2026-09-10T00:00:00Z', 'cus_B', 'sub_B', 'price_test_starter', 'active', '2026-10-01T00:00:00Z', false), 'applied', 'B downgrades to starter');
+select is(pg_temp.sync('evt_B2', 700, 'cus_B', 'sub_B', 'price_test_starter', 'active'), 'applied', 'B downgrades to starter');
 select is((select count(*)::int from public.tenant_members where tenant_id = '00000000-0000-0000-0000-00000000000b'), 3, 'downgrade keeps existing members');
 select throws_ok($$ insert into public.tenant_members (tenant_id, user_id) values ('00000000-0000-0000-0000-00000000000b', (select id from u where n = 8)) $$, 'PT402', null, 'over-limit tenant cannot add seats');
 delete from public.tenant_members where tenant_id = '00000000-0000-0000-0000-00000000000b' and user_id = (select id from u where n = 7);
@@ -182,7 +235,7 @@ select ok(private.has_feature('00000000-0000-0000-0000-00000000000e', 'recurring
 select ok(not private.has_feature('00000000-0000-0000-0000-00000000000e', 'data_export'), 'growth lacks data export');
 select ok(private.has_feature('00000000-0000-0000-0000-00000000000c', 'white_label'), 'agency (trialing) has white label');
 
-select is(public.apply_subscription_state('evt_C2', 'customer.subscription.deleted', '2026-09-20T00:00:00Z', 'cus_C', 'sub_C', 'price_test_agency', 'canceled', null, false), 'applied', 'C cancels');
+select is(pg_temp.sync('evt_C2', 710, 'cus_C', 'sub_C', 'price_test_agency', 'canceled', null, 'customer.subscription.deleted'), 'applied', 'C cancels');
 select ok(not private.has_feature('00000000-0000-0000-0000-00000000000c', 'online_payments'), 'canceled tenant loses features');
 select throws_ok($$ select private.consume_quota('00000000-0000-0000-0000-00000000000c', 'active_clients') $$, 'PT402', null, 'canceled tenant is read-only');
 
@@ -214,7 +267,8 @@ select throws_ok($$ update public.tenant_subscriptions set status = 'active' $$,
 select throws_ok($$ insert into public.tenant_members (tenant_id, user_id) values ('00000000-0000-0000-0000-00000000000a', '00000000-0000-0000-0001-000000000018') $$, '42501', null, 'cannot add members directly');
 select throws_ok($$ select private.consume_quota('00000000-0000-0000-0000-00000000000a', 'active_clients') $$, '42501', null, 'cannot call consume_quota');
 select throws_ok($$ select private.release_quota('00000000-0000-0000-0000-00000000000a', 'active_clients') $$, '42501', null, 'cannot call release_quota');
-select throws_ok($$ select public.apply_subscription_state('evt_hack', 'x', now(), 'cus_A', 'sub_A', 'price_test_agency', 'active', null, false) $$, '42501', null, 'cannot call apply_subscription_state');
+select throws_ok($$ select public.apply_subscription_state('evt_hack', 'x', 1, 'cus_A', 'sub_A', 'price_test_agency', 'active') $$, '42501', null, 'cannot call apply_subscription_state');
+select throws_ok($$ select public.stripe_sync_ticket() $$, '42501', null, 'cannot take sync tickets');
 select throws_ok($$ select public.sync_plan_prices('[]'::jsonb) $$, '42501', null, 'cannot call sync_plan_prices');
 select throws_ok($$ select * from public.stripe_webhook_events $$, '42501', null, 'cannot read webhook ledger');
 

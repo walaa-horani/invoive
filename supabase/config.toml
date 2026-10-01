@@ -421,3 +421,7 @@ verify_jwt = false
 # Called with the project's secret key; the function checks it via withSupabase({ auth: 'secret' }).
 [functions.sync-plan-prices]
 verify_jwt = false
+
+# Called by pg_cron with the secret key; checked via withSupabase({ auth: 'secret' }).
+[functions.reconcile-subscriptions]
+verify_jwt = false
