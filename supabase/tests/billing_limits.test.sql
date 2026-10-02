@@ -7,11 +7,11 @@ select * from no_plan();
 -- ---------------------------------------------------------------------------
 insert into auth.users (id, email)
 select ('00000000-0000-0000-0001-' || lpad(n::text, 12, '0'))::uuid, 'u' || n || '@test.local'
-from generate_series(1, 20) n;
+from generate_series(1, 30) n;
 
 create temp table u as
 select n, ('00000000-0000-0000-0001-' || lpad(n::text, 12, '0'))::uuid as id
-from generate_series(1, 20) n;
+from generate_series(1, 30) n;
 
 insert into public.tenants (id, name, stripe_customer_id) values
   ('00000000-0000-0000-0000-00000000000a', 'A starter', 'cus_A'),
@@ -21,7 +21,8 @@ insert into public.tenants (id, name, stripe_customer_id) values
   ('00000000-0000-0000-0000-00000000000e', 'E growth',  'cus_E'),
   ('00000000-0000-0000-0000-00000000000f', 'F unpaid',  'cus_F'),
   ('00000000-0000-0000-0000-000000000010', 'G trial',   'cus_G'),
-  ('00000000-0000-0000-0000-000000000011', 'H dunning', 'cus_H');
+  ('00000000-0000-0000-0000-000000000011', 'H dunning', 'cus_H'),
+  ('00000000-0000-0000-0000-000000000012', 'I changes', 'cus_I');
 
 -- Webhook-style call: ticket (p_seq) taken before the Stripe fetch.
 create function pg_temp.sync(
@@ -247,6 +248,89 @@ select private.reconcile_usage('00000000-0000-0000-0000-00000000000c');
 select is((select used from public.tenant_usage where tenant_id = '00000000-0000-0000-0000-00000000000c' and metric = 'team_seats'), 7, 'reconcile repairs seat drift');
 
 -- ---------------------------------------------------------------------------
+-- Plan changes: immediate upgrade, pending upgrade, scheduled downgrade
+-- ---------------------------------------------------------------------------
+select is(pg_temp.sync('evt_I1', 1000, 'cus_I', 'sub_I', 'price_test_starter', 'active', '2026-09-01', 'invoice.paid'), 'applied', 'I pays for starter');
+select lives_ok($$ insert into public.tenant_members (tenant_id, user_id, role) values ('00000000-0000-0000-0000-000000000012', (select id from u where n = 21), 'owner') $$, 'I starter: owner seat');
+select throws_ok($$ insert into public.tenant_members (tenant_id, user_id) values ('00000000-0000-0000-0000-000000000012', (select id from u where n = 22)) $$, 'PT402', null, 'I starter: 2nd seat blocked');
+
+-- change-plan writes Stripe's response through before replying.
+select is(pg_temp.sync(null, 1001, 'cus_I', 'sub_I', 'price_test_growth_v2', 'active', null, 'change_plan'), 'applied', 'upgrade to growth applied');
+select lives_ok($$
+  insert into public.tenant_members (tenant_id, user_id) values
+    ('00000000-0000-0000-0000-000000000012', (select id from u where n = 22)),
+    ('00000000-0000-0000-0000-000000000012', (select id from u where n = 23))
+$$, 'upgrade: growth seats usable in the very next statement');
+select throws_ok($$ insert into public.tenant_members (tenant_id, user_id) values ('00000000-0000-0000-0000-000000000012', (select id from u where n = 24)) $$, 'PT402', null, 'growth: 4th seat blocked');
+select isnt((select payment_confirmed_at from public.tenant_subscriptions where tenant_id = '00000000-0000-0000-0000-000000000012'), null, 'upgrade keeps the payment confirmation');
+
+-- Upgrade to agency whose invoice is not paid yet (pending_if_incomplete).
+select is(public.apply_subscription_state(
+  p_event_id => null, p_event_type => 'change_plan', p_sync_seq => 1002,
+  p_customer_id => 'cus_I', p_subscription_id => 'sub_I', p_price_id => 'price_test_growth_v2', p_status => 'active',
+  p_pending_price_id => 'price_test_agency', p_pending_update_expires_at => now() + interval '23 hours'), 'applied', 'pending upgrade mirrored');
+select is((select pending_plan_code::text from public.tenant_subscriptions where tenant_id = '00000000-0000-0000-0000-000000000012'), 'agency', 'pending plan resolved from its price');
+select is((select effective_plan::text from public.tenant_entitlements where tenant_id = '00000000-0000-0000-0000-000000000012' and metric = 'team_seats'), 'growth', 'unpaid upgrade grants nothing');
+select throws_ok($$ insert into public.tenant_members (tenant_id, user_id) values ('00000000-0000-0000-0000-000000000012', (select id from u where n = 24)) $$, 'PT402', null, 'unpaid upgrade: still growth seat limit');
+select ok(not private.has_feature('00000000-0000-0000-0000-000000000012', 'white_label'), 'unpaid upgrade: no agency features');
+
+-- Downgrade scheduled for the period end.
+select is(public.apply_subscription_state(
+  p_event_id => 'evt_I_sched', p_event_type => 'subscription_schedule.updated', p_sync_seq => 1003,
+  p_customer_id => 'cus_I', p_subscription_id => 'sub_I', p_price_id => 'price_test_growth_v2', p_status => 'active',
+  p_schedule_id => 'sub_sched_I', p_scheduled_price_id => 'price_test_starter', p_scheduled_change_at => now() + interval '10 days'),
+  'applied', 'scheduled downgrade mirrored');
+select is((select row(pending_price_id, scheduled_plan_code)::text from public.tenant_subscriptions where tenant_id = '00000000-0000-0000-0000-000000000012'),
+  '(,starter)', 'pending upgrade cleared, downgrade scheduled');
+select is((select effective_plan::text from public.tenant_entitlements where tenant_id = '00000000-0000-0000-0000-000000000012' and metric = 'team_seats'), 'growth', 'paid-for plan kept until the period ends');
+select ok(private.has_feature('00000000-0000-0000-0000-000000000012', 'recurring_invoices'), 'growth features kept until the period ends');
+
+-- Period end passes before the renewal webhook arrives.
+select is(public.apply_subscription_state(
+  p_event_id => null, p_event_type => 'reconcile', p_sync_seq => 1004,
+  p_customer_id => 'cus_I', p_subscription_id => 'sub_I', p_price_id => 'price_test_growth_v2', p_status => 'active',
+  p_schedule_id => 'sub_sched_I', p_scheduled_price_id => 'price_test_starter', p_scheduled_change_at => now() - interval '1 second'),
+  'applied', 'scheduled downgrade now due');
+select is((select effective_plan::text from public.tenant_entitlements where tenant_id = '00000000-0000-0000-0000-000000000012' and metric = 'team_seats'), 'starter', 'due downgrade applies immediately');
+select is(private.effective_plan('00000000-0000-0000-0000-000000000012')::text, 'starter', 'effective_plan agrees');
+select ok(not private.has_feature('00000000-0000-0000-0000-000000000012', 'recurring_invoices'), 'due downgrade removes growth features');
+select is((select count(*)::int from public.tenant_features where tenant_id = '00000000-0000-0000-0000-000000000012'), 1, 'features view: starter only');
+select throws_ok($$ insert into public.tenant_members (tenant_id, user_id) values ('00000000-0000-0000-0000-000000000012', (select id from u where n = 24)) $$, 'PT402', null, 'due downgrade: new seats blocked');
+select is((select count(*)::int from public.tenant_members where tenant_id = '00000000-0000-0000-0000-000000000012'), 3, 'due downgrade keeps existing members');
+
+-- A scheduled UPGRADE never applies before Stripe's own snapshot.
+select is(public.apply_subscription_state(
+  p_event_id => null, p_event_type => 'reconcile', p_sync_seq => 1005,
+  p_customer_id => 'cus_I', p_subscription_id => 'sub_I', p_price_id => 'price_test_starter', p_status => 'active',
+  p_schedule_id => 'sub_sched_I2', p_scheduled_price_id => 'price_test_agency', p_scheduled_change_at => now() - interval '1 second'),
+  'applied', 'stripe moved to starter; an upgrade is scheduled');
+select is(private.effective_plan('00000000-0000-0000-0000-000000000012')::text, 'starter', 'due scheduled upgrade waits for Stripe');
+
+select throws_ok($$
+  select public.apply_subscription_state(p_event_id => null, p_event_type => 'reconcile', p_sync_seq => 1006,
+    p_customer_id => 'cus_I', p_subscription_id => 'sub_I', p_price_id => 'price_test_starter', p_status => 'active',
+    p_pending_price_id => 'price_unknown', p_pending_update_expires_at => now())
+$$, 'P0001', null, 'unmapped pending price raises');
+select throws_ok($$
+  select public.apply_subscription_state(p_event_id => null, p_event_type => 'reconcile', p_sync_seq => 1006,
+    p_customer_id => 'cus_I', p_subscription_id => 'sub_I', p_price_id => 'price_test_starter', p_status => 'active',
+    p_schedule_id => 'sub_sched_I', p_scheduled_price_id => 'price_unknown', p_scheduled_change_at => now())
+$$, 'P0001', null, 'unmapped scheduled price raises');
+select throws_ok($$ update public.tenant_subscriptions set scheduled_change_at = null where tenant_id = '00000000-0000-0000-0000-000000000012' $$, '23514', null, 'scheduled fields are all-or-none');
+select throws_ok($$ update public.tenant_subscriptions set stripe_schedule_id = null where tenant_id = '00000000-0000-0000-0000-000000000012' $$, '23514', null, 'a scheduled change needs its schedule');
+
+-- Plan-change lease
+select ok(public.acquire_plan_change_lease('00000000-0000-0000-0000-000000000012', '00000000-0000-0000-0000-0000000000a1'), 'lease acquired');
+select ok(not public.acquire_plan_change_lease('00000000-0000-0000-0000-000000000012', '00000000-0000-0000-0000-0000000000a2'), 'second holder is refused');
+select ok(public.acquire_plan_change_lease('00000000-0000-0000-0000-000000000012', '00000000-0000-0000-0000-0000000000a1'), 'holder can extend its lease');
+select ok(not public.release_plan_change_lease('00000000-0000-0000-0000-000000000012', '00000000-0000-0000-0000-0000000000a2'), 'only the holder can release');
+update private.plan_change_leases set expires_at = clock_timestamp() - interval '1 second' where tenant_id = '00000000-0000-0000-0000-000000000012';
+select ok(public.acquire_plan_change_lease('00000000-0000-0000-0000-000000000012', '00000000-0000-0000-0000-0000000000a2'), 'expired lease can be taken over');
+select ok(public.release_plan_change_lease('00000000-0000-0000-0000-000000000012', '00000000-0000-0000-0000-0000000000a2'), 'holder releases');
+select ok(public.acquire_plan_change_lease('00000000-0000-0000-0000-000000000012', '00000000-0000-0000-0000-0000000000a1'), 'released lease is free again');
+select throws_ok($$ select public.acquire_plan_change_lease('00000000-0000-0000-0000-000000000012', '00000000-0000-0000-0000-0000000000a1', 0) $$, 'P0001', null, 'lease ttl is bounded');
+
+-- ---------------------------------------------------------------------------
 -- RLS + privileges (as tenant A's owner)
 -- ---------------------------------------------------------------------------
 select set_config('request.jwt.claims', json_build_object('sub', (select id from u where n = 1), 'role', 'authenticated')::text, true);
@@ -269,6 +353,9 @@ select throws_ok($$ select private.consume_quota('00000000-0000-0000-0000-000000
 select throws_ok($$ select private.release_quota('00000000-0000-0000-0000-00000000000a', 'active_clients') $$, '42501', null, 'cannot call release_quota');
 select throws_ok($$ select public.apply_subscription_state('evt_hack', 'x', 1, 'cus_A', 'sub_A', 'price_test_agency', 'active') $$, '42501', null, 'cannot call apply_subscription_state');
 select throws_ok($$ select public.stripe_sync_ticket() $$, '42501', null, 'cannot take sync tickets');
+select throws_ok($$ select public.acquire_plan_change_lease('00000000-0000-0000-0000-00000000000a', '00000000-0000-0000-0000-0000000000a1') $$, '42501', null, 'cannot take plan-change leases');
+select throws_ok($$ select public.release_plan_change_lease('00000000-0000-0000-0000-00000000000a', '00000000-0000-0000-0000-0000000000a1') $$, '42501', null, 'cannot release plan-change leases');
+select throws_ok($$ select * from private.plan_change_leases $$, '42501', null, 'cannot read plan-change leases');
 select throws_ok($$ select public.sync_plan_prices('[]'::jsonb) $$, '42501', null, 'cannot call sync_plan_prices');
 select throws_ok($$ select * from public.stripe_webhook_events $$, '42501', null, 'cannot read webhook ledger');
 

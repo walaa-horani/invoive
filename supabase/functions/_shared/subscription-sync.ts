@@ -21,8 +21,36 @@ export async function takeSyncTicket(db: SupabaseClient): Promise<number> {
   return Number(data)
 }
 
+// Everything applySnapshot reads: the latest invoice (dunning state) and the
+// attached schedule (scheduled downgrade).
+export const SNAPSHOT_EXPAND = ['latest_invoice', 'schedule']
+
 export function retrieveSubscription(subscriptionId: string) {
-  return stripe.subscriptions.retrieve(subscriptionId, { expand: ['latest_invoice'] })
+  return stripe.subscriptions.retrieve(subscriptionId, { expand: SNAPSHOT_EXPAND })
+}
+
+const priceIdOf = (price: string | { id: string } | null | undefined) =>
+  price == null ? null : typeof price === 'string' ? price : price.id
+
+// The next phase of the attached schedule that changes the price, i.e. a plan
+// change Stripe will make on its own at that phase's start_date.
+export function scheduledChangeOf(subscription: Stripe.Subscription) {
+  const schedule = typeof subscription.schedule === 'object' ? subscription.schedule : null
+  const scheduleId = typeof subscription.schedule === 'string' ? subscription.schedule : schedule?.id ?? null
+  if (!schedule || !['active', 'not_started'].includes(schedule.status)) {
+    return { scheduleId, priceId: null, changeAt: null }
+  }
+  const currentPriceId = subscription.items.data[0]?.price.id
+  const now = Math.floor(Date.now() / 1000)
+  const next = schedule.phases
+    .filter((phase) => phase.start_date > now)
+    .sort((a, b) => a.start_date - b.start_date)
+    .find((phase) => phase.items.length === 1 && priceIdOf(phase.items[0].price) !== currentPriceId)
+  return {
+    scheduleId,
+    priceId: next ? priceIdOf(next.items[0].price) : null,
+    changeAt: next ? toIso(next.start_date) : null,
+  }
 }
 
 export function subscriptionIdOf(invoice: Stripe.Invoice): string | null {
@@ -77,6 +105,12 @@ export async function applySnapshot(
   const latestInvoiceId = typeof subscription.latest_invoice === 'string'
     ? subscription.latest_invoice
     : latestInvoice?.id ?? null
+  // Upgrade waiting for its proration invoice to be paid.
+  const pending = subscription.pending_update
+  const pendingPriceId = pending?.subscription_items?.length === 1
+    ? pending.subscription_items[0].price.id
+    : null
+  const scheduled = scheduledChangeOf(subscription)
 
   const { data, error } = await db.rpc('apply_subscription_state', {
     p_event_id: opts.eventId,
@@ -97,6 +131,11 @@ export async function applySnapshot(
     p_latest_invoice_status: latestInvoice?.status ?? null,
     p_next_payment_attempt: toIso(latestInvoice?.next_payment_attempt),
     p_payment_confirmed_at: opts.paymentConfirmedAt,
+    p_pending_price_id: pendingPriceId,
+    p_pending_update_expires_at: pendingPriceId ? toIso(pending?.expires_at) : null,
+    p_schedule_id: scheduled.scheduleId,
+    p_scheduled_price_id: scheduled.priceId,
+    p_scheduled_change_at: scheduled.changeAt,
   })
   if (error) throw new Error(`apply_subscription_state: ${error.message}`)
 

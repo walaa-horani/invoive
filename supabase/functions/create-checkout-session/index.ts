@@ -7,25 +7,26 @@
 // - No double charges: Stripe itself is checked for an existing (or pending)
 //   subscription, an open session for the same price is reused, other open
 //   sessions are expired, and a per-minute idempotency key collapses
-//   double-clicks into one session. Plan changes go through the Billing Portal.
+//   double-clicks into one session. Plan changes for existing subscribers go
+//   through the change-plan function.
 // - Nothing is written about the subscription here: it is recorded only by
 //   the stripe-webhook function, and access is granted only after invoice.paid.
 import { withSupabase } from 'npm:@supabase/server@1.8.1'
 import type { SupabaseClient } from 'npm:@supabase/supabase-js@2'
-import { requireEnv, stripe } from '../_shared/stripe.ts'
+import {
+  appUrl,
+  billingCors,
+  errorResponse,
+  HttpError,
+  loadBillingContext,
+  readBillingRequest,
+  withPlanChangeLease,
+} from '../_shared/billing-context.ts'
+import { stripe } from '../_shared/stripe.ts'
 
-const appUrl = requireEnv('APP_URL').replace(/\/+$/, '')
-
-const PLAN_CODES = new Set(['starter', 'growth', 'agency'])
-const BILLING_ROLES = new Set(['owner', 'admin'])
 // Any of these means the customer already has, or is about to have, a paid
 // subscription. `incomplete` = first payment still processing (e.g. 3-D Secure).
 const BLOCKING_SUBSCRIPTION_STATUSES = new Set(['active', 'trialing', 'past_due', 'unpaid', 'paused', 'incomplete'])
-const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
-
-function errorResponse(status: number, message: string) {
-  return Response.json({ error: message }, { status })
-}
 
 // Returns the tenant's Stripe customer, creating it once. The idempotency key
 // makes concurrent requests for the same tenant get the same customer, and the
@@ -56,57 +57,18 @@ async function ensureCustomer(db: SupabaseClient, tenant: { id: string; name: st
 }
 
 export default {
-  fetch: withSupabase(
-    {
-      auth: 'user',
-      cors: {
-        headers: {
-          'Access-Control-Allow-Origin': appUrl,
-          'Access-Control-Allow-Headers': 'authorization, apikey, content-type, x-client-info',
-        },
-      },
-    },
-    async (req, ctx) => {
-      if (req.method !== 'POST') return errorResponse(405, 'method not allowed')
+  fetch: withSupabase({ auth: 'user', cors: billingCors }, async (req, ctx) => {
+    if (req.method !== 'POST') return errorResponse(405, 'method not allowed')
 
-      let body: Record<string, unknown>
-      try {
-        body = await req.json()
-      } catch {
-        return errorResponse(400, 'invalid JSON body')
-      }
-      const tenantId = body?.tenant_id
-      const planCode = body?.plan_code
-      if (typeof tenantId !== 'string' || !UUID_RE.test(tenantId)) {
-        return errorResponse(400, 'tenant_id must be a UUID')
-      }
-      if (typeof planCode !== 'string' || !PLAN_CODES.has(planCode)) {
-        return errorResponse(400, 'plan_code must be starter, growth or agency')
-      }
+    try {
+      const { tenantId, planCode } = await readBillingRequest(req)
+      const db = ctx.supabaseAdmin
+      const { tenant, price } = await loadBillingContext(db, ctx.userClaims!.id, tenantId, planCode)
+      const priceId = price.stripe_price_id
 
-      try {
-        const db = ctx.supabaseAdmin
-        const userId = ctx.userClaims!.id
-
-        const [member, tenant, price] = await Promise.all([
-          db.from('tenant_members').select('role').eq('tenant_id', tenantId).eq('user_id', userId).maybeSingle(),
-          db.from('tenants').select('id, name, stripe_customer_id').eq('id', tenantId).maybeSingle(),
-          db.from('plan_prices').select('stripe_price_id').eq('plan_code', planCode).eq('is_current', true).maybeSingle(),
-        ])
-        for (const result of [member, tenant, price]) {
-          if (result.error) throw result.error
-        }
-
-        if (!member.data || !BILLING_ROLES.has(member.data.role)) {
-          return errorResponse(403, 'only the tenant owner or an admin can manage billing')
-        }
-        if (!tenant.data) return errorResponse(404, 'tenant not found')
-        if (!price.data) {
-          return errorResponse(503, `no current Stripe price for ${planCode}; run sync-plan-prices`)
-        }
-
-        const priceId: string = price.data.stripe_price_id
-        const customerId = tenant.data.stripe_customer_id ?? await ensureCustomer(db, tenant.data)
+      // One billing change per tenant at a time (shared with change-plan).
+      const url = await withPlanChangeLease(db, tenantId, async () => {
+        const customerId = tenant.stripe_customer_id ?? await ensureCustomer(db, tenant)
 
         // Ask Stripe, not our mirror: the webhook for a just-finished checkout
         // may not have arrived yet.
@@ -116,17 +78,17 @@ export default {
         ])
         const existing = subscriptions.data.find((s) => BLOCKING_SUBSCRIPTION_STATUSES.has(s.status))
         if (existing) {
-          return errorResponse(
+          throw new HttpError(
             409,
             existing.status === 'incomplete'
               ? 'a payment for this tenant is still being processed; try again in a few minutes'
-              : 'tenant already has a subscription; change plans in the billing portal',
+              : 'tenant already has a subscription; use change-plan to switch plans',
           )
         }
 
         // At most one open session per tenant, so two can never both be paid.
         const reusable = openSessions.data.find((s) => s.metadata?.price_id === priceId)
-        if (reusable?.url) return Response.json({ url: reusable.url })
+        if (reusable?.url) return reusable.url
         await Promise.all(openSessions.data.map((s) => stripe.checkout.sessions.expire(s.id)))
 
         const session = await stripe.checkout.sessions.create(
@@ -146,14 +108,16 @@ export default {
           { idempotencyKey: `checkout-${tenantId}-${priceId}-${Math.floor(Date.now() / 60_000)}` },
         )
         if (session.status !== 'open' || !session.url) {
-          return errorResponse(409, 'a checkout for this plan was just completed; refresh the billing page')
+          throw new HttpError(409, 'a checkout for this plan was just completed; refresh the billing page')
         }
+        return session.url
+      })
 
-        return Response.json({ url: session.url })
-      } catch (err) {
-        console.error('create-checkout-session failed:', err)
-        return errorResponse(500, 'could not start checkout')
-      }
-    },
-  ),
+      return Response.json({ url })
+    } catch (err) {
+      if (err instanceof HttpError) return errorResponse(err.status, err.message, err.extra)
+      console.error('create-checkout-session failed:', err)
+      return errorResponse(500, 'could not start checkout')
+    }
+  }),
 }

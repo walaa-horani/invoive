@@ -12,7 +12,7 @@
 import { withSupabase } from 'npm:@supabase/server@1.8.1'
 import type { SupabaseClient } from 'npm:@supabase/supabase-js@2'
 import { type Stripe, stripe } from '../_shared/stripe.ts'
-import { applySnapshot, isConfirmedPayment, paidAtOf, takeSyncTicket } from '../_shared/subscription-sync.ts'
+import { applySnapshot, isConfirmedPayment, paidAtOf, SNAPSHOT_EXPAND, takeSyncTicket } from '../_shared/subscription-sync.ts'
 
 const PAGE_SIZE = 200
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
@@ -39,7 +39,7 @@ async function reconcileTenant(db: SupabaseClient, customerId: string) {
     customer: customerId,
     status: 'all',
     limit: 100,
-    expand: ['data.latest_invoice'],
+    expand: SNAPSHOT_EXPAND.map((field) => `data.${field}`),
   })
   if (subscriptions.length === 0) return 'no_subscription'
 

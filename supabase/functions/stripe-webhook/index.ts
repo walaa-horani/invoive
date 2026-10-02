@@ -53,6 +53,18 @@ const INVOICE_SYNC_EVENTS = new Set<string>([
   'invoice.voided',
 ])
 
+// A scheduled downgrade was created, changed, cancelled or carried out.
+// Editing a schedule's phases does not touch the subscription itself, so
+// customer.subscription.updated alone would miss it.
+const SCHEDULE_EVENTS = new Set<string>([
+  'subscription_schedule.created',
+  'subscription_schedule.updated',
+  'subscription_schedule.released',
+  'subscription_schedule.canceled',
+  'subscription_schedule.completed',
+  'subscription_schedule.aborted',
+])
+
 // Which subscription the event is about, and whether it proves a payment.
 async function resolveTarget(event: Stripe.Event) {
   if (SUBSCRIPTION_EVENTS.has(event.type)) {
@@ -60,6 +72,12 @@ async function resolveTarget(event: Stripe.Event) {
   }
   if (event.type === 'invoice.paid') {
     return await confirmInvoicePayment((event.data.object as Stripe.Invoice).id!)
+  }
+  if (SCHEDULE_EVENTS.has(event.type)) {
+    const schedule = event.data.object as Stripe.SubscriptionSchedule
+    const subscription = schedule.subscription ?? schedule.released_subscription
+    if (!subscription) throw new IgnoredEvent(`schedule ${schedule.id} has no subscription`)
+    return { subscriptionId: typeof subscription === 'string' ? subscription : subscription.id, paidAt: null }
   }
   if (INVOICE_SYNC_EVENTS.has(event.type)) {
     const subscriptionId = subscriptionIdOf(event.data.object as Stripe.Invoice)
