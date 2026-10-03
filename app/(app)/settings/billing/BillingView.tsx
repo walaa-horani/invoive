@@ -1,4 +1,3 @@
-import Link from "next/link";
 import {
   FEATURE_LABELS,
   FEATURE_ORDER,
@@ -9,10 +8,9 @@ import {
   METRIC_ORDER,
 } from "@/lib/billing/format";
 import type { BillingPageData, Plan } from "@/lib/billing/load";
+import { BILLING_ROLES } from "@/lib/workspace";
 import { CheckoutReturn } from "./CheckoutReturn";
 import { PlanAction } from "./PlanAction";
-
-const BILLING_ROLES = new Set(["owner", "admin"]);
 
 const STATUS_BADGES: Record<string, { label: string; className: string }> = {
   active: { label: "Active", className: "bg-[#85f8c4]/40 text-[#005236]" },
@@ -38,16 +36,6 @@ export function BillingView({ data, checkout }: { data: BillingPageData; checkou
           <p className="text-sm text-[#45464d] mt-1">
             Plan and usage for <strong className="text-[#0b1c30]">{data.tenant.name}</strong>
           </p>
-        </div>
-        <div className="flex flex-wrap items-center gap-2">
-          {data.tenants.length > 1 && <TenantSwitcher data={data} />}
-          <Link
-            href="/settings/workspaces/new"
-            className="inline-flex items-center gap-1 text-sm font-medium px-3 py-1.5 rounded-lg border border-[#E2E8F0] bg-white text-[#0F172A] hover:border-[#CBD5E1] hover:bg-[#F8FAFC]"
-          >
-            <span aria-hidden className="material-symbols-outlined text-[18px]">add</span>
-            New workspace
-          </Link>
         </div>
       </div>
 
@@ -399,25 +387,4 @@ function Notice({ tone, children }: { tone: "info" | "warning"; children: React.
   const styles =
     tone === "warning" ? "bg-[#fff4e5] border-[#ffddb3] text-[#623f00]" : "bg-[#eff4ff] border-[#dce9ff] text-[#0b1c30]";
   return <div className={`rounded-xl border px-4 py-3 text-sm ${styles}`}>{children}</div>;
-}
-
-function TenantSwitcher({ data }: { data: BillingPageData }) {
-  return (
-    <nav aria-label="Workspaces" className="flex flex-wrap gap-2">
-      {data.tenants.map((t) => (
-        <Link
-          key={t.id}
-          href={`/settings/billing?tenant=${t.id}`}
-          aria-current={t.id === data.tenant.id ? "page" : undefined}
-          className={`text-sm px-3 py-1.5 rounded-lg border ${
-            t.id === data.tenant.id
-              ? "bg-[#0051d5] border-[#0051d5] text-white"
-              : "bg-white border-[#dce9ff] text-[#45464d] hover:text-[#0b1c30]"
-          }`}
-        >
-          {t.name}
-        </Link>
-      ))}
-    </nav>
-  );
 }

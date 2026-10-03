@@ -3,7 +3,7 @@ import { NextResponse, type NextRequest } from "next/server";
 import { supabaseEnv } from "@/lib/supabase/env";
 
 // Refreshes the Supabase session on every request (Server Components can't
-// write cookies) and sends signed-out visitors of /settings to /login.
+// write cookies) and sends signed-out visitors of app pages to /login.
 // This redirect is only a convenience: pages check the user again and the
 // data itself is protected by RLS.
 export async function proxy(request: NextRequest) {
@@ -31,7 +31,9 @@ export async function proxy(request: NextRequest) {
 
   const { data } = await supabase.auth.getClaims();
 
-  if (!data?.claims && request.nextUrl.pathname.startsWith("/settings")) {
+  const { pathname } = request.nextUrl;
+  const isAppPage = ["/settings", "/clients"].some((p) => pathname === p || pathname.startsWith(`${p}/`));
+  if (!data?.claims && isAppPage) {
     const login = request.nextUrl.clone();
     login.pathname = "/login";
     login.search = `?next=${encodeURIComponent(request.nextUrl.pathname + request.nextUrl.search)}`;

@@ -1,5 +1,6 @@
 import "server-only";
 import type { SupabaseClient } from "@supabase/supabase-js";
+import type { Workspace } from "@/lib/workspace";
 import type { PlanCode, PlanFeature, UsageMetric } from "./format";
 
 // Everything the billing page shows, read as the signed-in user: RLS limits
@@ -38,8 +39,8 @@ export type Usage = {
 };
 
 export type BillingPageData = {
-  tenants: { id: string; name: string; role: string }[];
-  tenant: { id: string; name: string; role: string };
+  tenants: Workspace[];
+  tenant: Workspace;
   plans: Plan[];
   subscription: Subscription | null;
   subscriptionPrice: { amount: number; currency: string } | null;
@@ -57,20 +58,9 @@ function must<T>(result: { data: T | null; error: { message: string } | null }, 
 
 export async function loadBillingPage(
   supabase: SupabaseClient,
-  userId: string,
-  requestedTenantId: string | undefined,
-): Promise<BillingPageData | null> {
-  const memberships = must(
-    await supabase.from("tenant_members").select("tenant_id, role, tenants(name)").eq("user_id", userId),
-    "tenant_members",
-  ) as unknown as { tenant_id: string; role: string; tenants: { name: string } | null }[];
-  if (memberships.length === 0) return null;
-
-  const tenants = memberships
-    .map((m) => ({ id: m.tenant_id, name: m.tenants?.name ?? "Workspace", role: m.role }))
-    .sort((a, b) => a.name.localeCompare(b.name));
-  const tenant = tenants.find((t) => t.id === requestedTenantId) ?? tenants[0];
-
+  tenant: Workspace,
+  tenants: Workspace[],
+): Promise<BillingPageData> {
   const [plans, limits, features, prices, subscription, usage] = await Promise.all([
     supabase.from("plans").select("code, name, rank").order("rank"),
     supabase.from("plan_limits").select("plan_code, metric, max_value"),

@@ -1,7 +1,9 @@
 "use server";
 
+import { cookies } from "next/headers";
 import { redirect } from "next/navigation";
 import { createClient } from "@/lib/supabase/server";
+import { WORKSPACE_COOKIE, WORKSPACE_COOKIE_OPTIONS } from "@/lib/workspace";
 
 export type CreateWorkspaceState = { error?: string };
 
@@ -25,5 +27,7 @@ export async function createWorkspace(_prev: CreateWorkspaceState, formData: For
     };
   }
 
-  redirect(`/settings/billing?tenant=${data as string}`);
+  // The new workspace becomes the active one.
+  (await cookies()).set(WORKSPACE_COOKIE, data as string, WORKSPACE_COOKIE_OPTIONS);
+  redirect("/settings/billing");
 }

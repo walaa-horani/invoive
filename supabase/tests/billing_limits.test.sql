@@ -376,5 +376,74 @@ select throws_ok($$ select public.create_tenant('Anon WS') $$, '42501', null, 'a
 select is((select count(*)::int from public.plan_limits), 9, 'anon can read plan limits (pricing page)');
 reset role;
 
+
+-- ---------------------------------------------------------------------------
+-- Clients: active_clients quota, archive/restore, RLS
+-- ---------------------------------------------------------------------------
+insert into public.tenants (id, name, stripe_customer_id) values ('00000000-0000-0000-0000-000000000013', 'J clients', 'cus_J');
+select is(pg_temp.sync('evt_J1', 1100, 'cus_J', 'sub_J', 'price_test_starter', 'active', '2026-09-01', 'invoice.paid'), 'applied', 'J pays for starter');
+insert into public.tenant_members (tenant_id, user_id, role) values ('00000000-0000-0000-0000-000000000013', (select id from u where n = 25), 'owner');
+
+select lives_ok($$
+  insert into public.clients (tenant_id, name, email, company)
+  select '00000000-0000-0000-0000-000000000013', 'Client ' || n, 'c' || n || '@example.com', 'Co ' || n from generate_series(1, 5) n
+$$, 'starter: 5 active clients');
+select is((select used from public.tenant_usage where tenant_id = '00000000-0000-0000-0000-000000000013' and metric = 'active_clients'), 5, 'counter follows inserts');
+select throws_ok($$ insert into public.clients (tenant_id, name) values ('00000000-0000-0000-0000-000000000013', 'Client 6') $$, 'PT402', null, 'starter: 6th client blocked');
+select is((select count(*)::int from public.clients where tenant_id = '00000000-0000-0000-0000-000000000013'), 5, 'refused client was not saved');
+
+update public.clients set status = 'archived' where tenant_id = '00000000-0000-0000-0000-000000000013' and name = 'Client 1';
+select is((select used from public.tenant_usage where tenant_id = '00000000-0000-0000-0000-000000000013' and metric = 'active_clients'), 4, 'archiving frees a slot');
+select isnt((select archived_at from public.clients where tenant_id = '00000000-0000-0000-0000-000000000013' and name = 'Client 1'), null, 'archived_at is set');
+select lives_ok($$ insert into public.clients (tenant_id, name) values ('00000000-0000-0000-0000-000000000013', 'Client 6') $$, 'freed slot can be used');
+select throws_ok($$ update public.clients set status = 'active' where tenant_id = '00000000-0000-0000-0000-000000000013' and name = 'Client 1' $$, 'PT402', null, 'restore needs a free slot');
+select is((select status::text from public.clients where tenant_id = '00000000-0000-0000-0000-000000000013' and name = 'Client 1'), 'archived', 'refused restore left the client archived');
+
+select is(pg_temp.sync('evt_J2', 1101, 'cus_J', 'sub_J', 'price_test_growth_v2', 'active', null, 'change_plan'), 'applied', 'J upgrades to growth');
+select lives_ok($$ update public.clients set status = 'active' where tenant_id = '00000000-0000-0000-0000-000000000013' and name = 'Client 1' $$, 'after upgrade the restore succeeds');
+select is((select archived_at from public.clients where tenant_id = '00000000-0000-0000-0000-000000000013' and name = 'Client 1'), null, 'restore clears archived_at');
+select is((select used from public.tenant_usage where tenant_id = '00000000-0000-0000-0000-000000000013' and metric = 'active_clients'), 6, 'counter: 6 active on growth');
+
+select lives_ok($$ update public.clients set name = '  Renamed  ', email = '  MIXED@Example.COM ', company = '' where tenant_id = '00000000-0000-0000-0000-000000000013' and name = 'Client 2' $$, 'edit a client');
+select is((select row(name, email, company)::text from public.clients where tenant_id = '00000000-0000-0000-0000-000000000013' and name = 'Renamed'), '(Renamed,mixed@example.com,)', 'fields are trimmed and normalized');
+select throws_ok($$ insert into public.clients (tenant_id, name, email) values ('00000000-0000-0000-0000-000000000013', 'Bad', 'not-an-email') $$, '23514', null, 'invalid email rejected');
+select throws_ok($$ insert into public.clients (tenant_id, name) values ('00000000-0000-0000-0000-000000000013', '   ') $$, '23514', null, 'blank name rejected');
+select throws_ok($$ update public.clients set tenant_id = '00000000-0000-0000-0000-00000000000a' where tenant_id = '00000000-0000-0000-0000-000000000013' and name = 'Client 3' $$, '42501', null, 'a client cannot move to another workspace');
+
+delete from public.clients where tenant_id = '00000000-0000-0000-0000-000000000013' and name = 'Client 3';
+select is((select used from public.tenant_usage where tenant_id = '00000000-0000-0000-0000-000000000013' and metric = 'active_clients'), 5, 'deleting an active client releases its slot');
+
+update public.tenant_usage set used = 99 where tenant_id = '00000000-0000-0000-0000-000000000013' and metric = 'active_clients';
+select private.reconcile_usage('00000000-0000-0000-0000-000000000013');
+select is((select used from public.tenant_usage where tenant_id = '00000000-0000-0000-0000-000000000013' and metric = 'active_clients'), 5, 'reconcile recounts active clients');
+
+-- As J's owner
+select set_config('request.jwt.claims', json_build_object('sub', (select id from u where n = 25), 'role', 'authenticated')::text, true);
+select set_config('request.jwt.claim.sub', (select id from u where n = 25)::text, true);
+set local role authenticated;
+
+select is((select count(*)::int from public.clients), 5, 'owner sees only their workspace clients');
+select lives_ok($$ insert into public.clients (tenant_id, name) values ('00000000-0000-0000-0000-000000000013', 'Via API') $$, 'owner adds a client');
+select lives_ok($$ update public.clients set status = 'archived' where name = 'Via API' $$, 'owner archives a client');
+select throws_ok($$ insert into public.clients (tenant_id, name) values ('00000000-0000-0000-0000-00000000000a', 'Intruder') $$, '42501', null, 'cannot add clients to another workspace');
+select is((select count(*)::int from public.clients where tenant_id = '00000000-0000-0000-0000-00000000000a'), 0, 'cannot see other workspaces clients');
+select throws_ok($$ update public.clients set tenant_id = '00000000-0000-0000-0000-00000000000a' $$, '42501', null, 'tenant_id is not writable');
+select throws_ok($$ update public.clients set archived_at = null $$, '42501', null, 'archived_at is not writable');
+select throws_ok($$ delete from public.clients $$, '42501', null, 'clients cannot be deleted through the API');
+reset role;
+
+-- Approvers are read-only (J is on growth: room for a 2nd seat; roles need
+-- the agency feature, so grant it by moving J to agency first).
+select is(pg_temp.sync('evt_J3', 1102, 'cus_J', 'sub_J', 'price_test_agency', 'active', null, 'change_plan'), 'applied', 'J upgrades to agency');
+insert into public.tenant_members (tenant_id, user_id, role) values ('00000000-0000-0000-0000-000000000013', (select id from u where n = 26), 'approver');
+select set_config('request.jwt.claims', json_build_object('sub', (select id from u where n = 26), 'role', 'authenticated')::text, true);
+select set_config('request.jwt.claim.sub', (select id from u where n = 26)::text, true);
+set local role authenticated;
+select is((select count(*)::int from public.clients), 6, 'approver can read clients');
+select throws_ok($$ insert into public.clients (tenant_id, name) values ('00000000-0000-0000-0000-000000000013', 'Approver add') $$, '42501', null, 'approver cannot add clients');
+update public.clients set name = 'Approver edit' where name = 'Renamed';
+select is((select count(*)::int from public.clients where name = 'Approver edit'), 0, 'approver cannot edit clients');
+reset role;
+
 select * from finish();
 rollback;
