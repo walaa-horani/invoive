@@ -100,6 +100,12 @@ export default {
     } catch (err) {
       if (err instanceof HttpError) return errorResponse(err.status, err.message, err.extra)
       console.error('connect-onboarding failed:', err)
+      // Stripe's refusals (platform setup, country, capabilities...) are
+      // actionable for the owner/admin calling this, so pass them through.
+      const stripeError = err as { type?: string; message?: string; code?: string }
+      if (typeof stripeError?.type === 'string' && stripeError.type.startsWith('Stripe') && stripeError.message) {
+        return errorResponse(502, `Stripe: ${stripeError.message}`, { code: stripeError.code ?? null })
+      }
       return errorResponse(500, 'could not start Stripe onboarding')
     }
   }),
