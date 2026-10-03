@@ -22,18 +22,33 @@ import {
   readBillingRequest,
   withPlanChangeLease,
 } from '../_shared/billing-context.ts'
-import { stripe } from '../_shared/stripe.ts'
+import { requireEnv, stripe } from '../_shared/stripe.ts'
 
 // Any of these means the customer already has, or is about to have, a paid
 // subscription. `incomplete` = first payment still processing (e.g. 3-D Secure).
 const BLOCKING_SUBSCRIPTION_STATUSES = new Set(['active', 'trialing', 'past_due', 'unpaid', 'paused', 'incomplete'])
+
+// Testing only: with STRIPE_TEST_CLOCKS=true and a test-mode key, every new
+// customer gets its own Stripe test clock, so renewals and scheduled
+// downgrades can be tried by advancing the clock in the Stripe Dashboard
+// (Billing > Test clocks). Never used with a live key.
+async function testClockFor(tenant: { id: string; name: string }) {
+  if (Deno.env.get('STRIPE_TEST_CLOCKS') !== 'true' || !/^(sk|rk)_test_/.test(requireEnv('STRIPE_SECRET_KEY'))) {
+    return undefined
+  }
+  const clock = await stripe.testHelpers.testClocks.create(
+    { frozen_time: Math.floor(Date.now() / 1000), name: `${tenant.name} (${tenant.id.slice(0, 8)})` },
+    { idempotencyKey: `tenant-clock-${tenant.id}` },
+  )
+  return clock.id
+}
 
 // Returns the tenant's Stripe customer, creating it once. The idempotency key
 // makes concurrent requests for the same tenant get the same customer, and the
 // conditional update keeps whichever ID was stored first.
 async function ensureCustomer(db: SupabaseClient, tenant: { id: string; name: string }) {
   const customer = await stripe.customers.create(
-    { name: tenant.name, metadata: { tenant_id: tenant.id } },
+    { name: tenant.name, metadata: { tenant_id: tenant.id }, test_clock: await testClockFor(tenant) },
     { idempotencyKey: `tenant-customer-${tenant.id}` },
   )
 

@@ -359,10 +359,20 @@ select throws_ok($$ select * from private.plan_change_leases $$, '42501', null, 
 select throws_ok($$ select public.sync_plan_prices('[]'::jsonb) $$, '42501', null, 'cannot call sync_plan_prices');
 select throws_ok($$ select * from public.stripe_webhook_events $$, '42501', null, 'cannot read webhook ledger');
 
+-- Self-service workspace creation (still as tenant A's owner)
+select ok(public.create_tenant('  Fresh Workspace  ') is not null, 'create_tenant returns the new id');
+select is((select name from public.tenants where name like '%Fresh%'), 'Fresh Workspace', 'name is trimmed; creator can read the new workspace');
+select is((select role::text from public.tenant_members m join public.tenants t on t.id = m.tenant_id where t.name = 'Fresh Workspace'), 'owner', 'creator is the owner');
+select is((select effective_plan::text from public.tenant_entitlements e join public.tenants t on t.id = e.tenant_id where t.name = 'Fresh Workspace' and e.metric = 'team_seats'), null, 'new workspace has no plan (read-only)');
+select throws_ok($$ select public.create_tenant('   ') $$, '22023', null, 'blank workspace name rejected');
+select lives_ok($$ select public.create_tenant('WS 3'); select public.create_tenant('WS 4'); select public.create_tenant('WS 5') $$, 'up to 5 owned workspaces');
+select throws_ok($$ select public.create_tenant('WS 6') $$, 'P0001', null, 'a 6th owned workspace is refused');
+
 reset role;
 set local role anon;
 select throws_ok($$ select * from public.tenants $$, '42501', null, 'anon cannot read tenants');
 select throws_ok($$ select * from public.tenant_entitlements $$, '42501', null, 'anon cannot read entitlements');
+select throws_ok($$ select public.create_tenant('Anon WS') $$, '42501', null, 'anon cannot create workspaces');
 select is((select count(*)::int from public.plan_limits), 9, 'anon can read plan limits (pricing page)');
 reset role;
 

@@ -1,27 +1,4 @@
-// Upgrades and downgrades for existing subscribers.
-//
-// POST { tenant_id, plan_code, action: 'preview' }
-// POST { tenant_id, plan_code, action: 'confirm', proration_date, expected_amount_due }
-//
-// - Upgrade: immediate. The prorated difference for the rest of the period is
-//   invoiced and charged at once (proration_behavior=always_invoice) with
-//   payment_behavior=pending_if_incomplete: if the charge fails or needs 3-D
-//   Secure, Stripe keeps the old price and the new plan applies only once that
-//   invoice is paid (the webhook picks it up). Never a plan without payment.
-// - Downgrade: at the end of the period already paid for, via a Subscription
-//   Schedule with proration_behavior=none. No credit, no refund, nothing
-//   charged mid-cycle. Choosing the current plan again cancels it.
-// - Exact amount: 'preview' asks Stripe for the proration at a server-chosen
-//   proration_date. 'confirm' re-previews at that same date and refuses if the
-//   amount differs from what the user saw, then charges with that date.
-// - No double charge: a confirm runs under the per-tenant lease (one billing
-//   change at a time) on freshly loaded Stripe state, and the charge carries a
-//   Stripe idempotency key per (subscription, price, proration_date).
-// - Immediate limits: the snapshot Stripe returns is applied to
-//   public.tenant_subscriptions before responding. Scheduled downgrades are
-//   enforced by the database from scheduled_change_at onward.
-// - Never trusts the client: plan code only, prices from plan_prices, current
-//   state re-fetched from Stripe.
+
 import { withSupabase } from 'npm:@supabase/server@1.8.1'
 import type { SupabaseClient } from 'npm:@supabase/supabase-js@2'
 import {
@@ -51,6 +28,8 @@ const idOf = (value: string | { id: string } | null) => (value == null || typeof
 type Context = {
   db: SupabaseClient
   tenantId: string
+  // "Now" as Stripe sees it for this subscription (see stripeNow).
+  now: number
   customerId: string
   subscription: Stripe.Subscription
   item: Stripe.SubscriptionItem
@@ -95,6 +74,17 @@ async function loadSubscription(db: SupabaseClient, tenantId: string, customerId
     throw new Error(`subscription ${subscription.id} has ${subscription.items.data.length} items, expected 1`)
   }
   return { subscription, item: subscription.items.data[0] }
+}
+
+// Real time, or the frozen time of the subscription's Stripe test clock
+// (test mode only). Proration dates and schedule phases are checked against
+// the subscription's own clock, so a test run that advanced the clock still
+// gets valid dates.
+async function stripeNow(subscription: Stripe.Subscription) {
+  const clockId = idOf(subscription.test_clock)
+  if (!clockId) return nowSeconds()
+  const clock = await stripe.testHelpers.testClocks.retrieve(clockId)
+  return clock.frozen_time
 }
 
 async function planRanks(db: SupabaseClient, priceId: string) {
@@ -145,7 +135,7 @@ async function releaseSchedule(scheduleId: string | null) {
 
 async function upgrade(ctx: Context, body: Record<string, unknown>, confirm: boolean) {
   if (!confirm) {
-    const prorationDate = nowSeconds()
+    const prorationDate = ctx.now
     const preview = await upgradePreview(ctx, prorationDate)
     return {
       kind: 'upgrade',
@@ -161,7 +151,7 @@ async function upgrade(ctx: Context, body: Record<string, unknown>, confirm: boo
   const expectedAmount = body.expected_amount_due
   if (
     typeof prorationDate !== 'number' || !Number.isInteger(prorationDate) ||
-    prorationDate > nowSeconds() || prorationDate < nowSeconds() - PREVIEW_TTL_SECONDS
+    prorationDate > ctx.now || prorationDate < ctx.now - PREVIEW_TTL_SECONDS
   ) {
     throw new HttpError(409, 'preview expired; preview the change again', { reason: 'preview_expired' })
   }
@@ -212,8 +202,8 @@ async function upgrade(ctx: Context, body: Record<string, unknown>, confirm: boo
 function discountParams(phase: Stripe.SubscriptionSchedule.Phase | undefined) {
   return (phase?.discounts ?? []).map((d) =>
     d.discount ? { discount: idOf(d.discount)! }
-    : d.promotion_code ? { promotion_code: idOf(d.promotion_code)! }
-    : { coupon: idOf(d.coupon)! }
+      : d.promotion_code ? { promotion_code: idOf(d.promotion_code)! }
+        : { coupon: idOf(d.coupon)! }
   )
 }
 
@@ -236,7 +226,7 @@ async function downgrade(ctx: Context, confirm: boolean) {
   if (!schedule || !['active', 'not_started'].includes(schedule.status)) {
     schedule = await stripe.subscriptionSchedules.create({ from_subscription: ctx.subscription.id })
   }
-  const currentPhase = schedule.phases.find((p) => p.start_date <= nowSeconds() && p.end_date > nowSeconds()) ??
+  const currentPhase = schedule.phases.find((p) => p.start_date <= ctx.now && p.end_date > ctx.now) ??
     schedule.phases[0]
   const discounts = discountParams(currentPhase)
   const recurring = ctx.item.price.recurring
@@ -308,6 +298,7 @@ export default {
         const change: Context = {
           db,
           tenantId,
+          now: await stripeNow(subscription),
           customerId: tenant.stripe_customer_id!,
           subscription,
           item,
@@ -322,8 +313,8 @@ export default {
         return direction > 0
           ? await upgrade(change, body, confirm)
           : direction < 0
-          ? await downgrade(change, confirm)
-          : await cancelScheduledChange(change, confirm)
+            ? await downgrade(change, confirm)
+            : await cancelScheduledChange(change, confirm)
       }
       const result = confirm ? await withPlanChangeLease(db, tenantId, run) : await run()
       return Response.json(result)

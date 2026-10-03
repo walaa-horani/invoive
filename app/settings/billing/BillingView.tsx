@@ -39,7 +39,16 @@ export function BillingView({ data, checkout }: { data: BillingPageData; checkou
             Plan and usage for <strong className="text-[#0b1c30]">{data.tenant.name}</strong>
           </p>
         </div>
-        {data.tenants.length > 1 && <TenantSwitcher data={data} />}
+        <div className="flex flex-wrap items-center gap-2">
+          {data.tenants.length > 1 && <TenantSwitcher data={data} />}
+          <Link
+            href="/settings/workspaces/new"
+            className="inline-flex items-center gap-1 text-sm font-medium px-3 py-1.5 rounded-lg border border-[#E2E8F0] bg-white text-[#0F172A] hover:border-[#CBD5E1] hover:bg-[#F8FAFC]"
+          >
+            <span aria-hidden className="material-symbols-outlined text-[18px]">add</span>
+            New workspace
+          </Link>
+        </div>
       </div>
 
       {checkout === "success" && <CheckoutReturn activated={currentPlan !== null} />}
@@ -410,14 +419,5 @@ function TenantSwitcher({ data }: { data: BillingPageData }) {
         </Link>
       ))}
     </nav>
-  );
-}
-
-export function EmptyState({ title, body }: { title: string; body: string }) {
-  return (
-    <div className="max-w-md mx-auto text-center py-20">
-      <h1 className="font-headline text-2xl font-bold text-[#0b1c30]">{title}</h1>
-      <p className="text-sm text-[#45464d] mt-2">{body}</p>
-    </div>
   );
 }
