@@ -2,6 +2,7 @@ import type { Metadata } from "next";
 import Link from "next/link";
 import { BILLING_ROLES, getActiveWorkspace, getSession } from "@/lib/workspace";
 import { CreateWorkspaceForm } from "../workspaces/CreateWorkspaceForm";
+import { secondaryButton } from "../../clients/ClientDialog";
 import { ConnectStripe } from "./ConnectStripe";
 
 export const metadata: Metadata = { title: "Payments — LedgerFlow" };
@@ -109,6 +110,28 @@ export default async function PaymentsPage({ searchParams }: { searchParams: Pro
           )}
         </div>
       </section>
+
+      {row && row.status !== "disconnected" && (
+        <section className="flex flex-wrap items-center justify-between gap-4 rounded-[24px] border border-[#E2E8F0] bg-white p-6 md:p-8">
+          <div className="flex flex-col gap-1">
+            <h2 className="font-headline-sm text-[#0F172A]">Payments, payouts and balance</h2>
+            <p className="max-w-md text-sm text-[#475569]">
+              Every client payment lands in your own Stripe account. See payments, refunds, disputes, fees and payouts in
+              your Stripe Dashboard — sign in with the Stripe login you created during setup.
+            </p>
+          </div>
+          {/* The tenant's own full Stripe Dashboard: access is controlled by Stripe's login, not by LedgerFlow. */}
+          <a
+            href="https://dashboard.stripe.com/"
+            target="_blank"
+            rel="noopener noreferrer"
+            className={secondaryButton}
+          >
+            Open Stripe Dashboard
+            <span aria-hidden className="material-symbols-outlined text-[18px]">open_in_new</span>
+          </a>
+        </section>
+      )}
     </div>
   );
 }
