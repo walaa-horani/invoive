@@ -1,11 +1,13 @@
 // Connects a workspace's own Stripe account (Stripe Connect, Accounts v2) so
 // its clients can pay invoices online.
 //
-// POST { tenant_id, action: 'onboard' | 'refresh' } as the workspace owner or
-// an admin.
+// POST { tenant_id, action: 'onboard' | 'refresh', country? } as the workspace
+// owner or an admin.
 //   onboard - creates the connected account once per workspace (full Stripe
 //             Dashboard; Stripe collects its fees from the account and carries
 //             losses), records it, and returns a Stripe-hosted onboarding link.
+//             `country` (ISO 3166-1 alpha-2) is required the first time: Stripe
+//             needs it before it can enable card payments.
 //   refresh - re-reads the account from Stripe and mirrors its status (used
 //             when the user comes back from onboarding).
 // The account id is only ever created and stored here, never taken from a
@@ -18,6 +20,7 @@ import { stripe } from '../_shared/stripe.ts'
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
 const ADMIN_ROLES = new Set(['owner', 'admin'])
+const COUNTRY_RE = /^[A-Z]{2}$/
 
 async function loadTenant(db: SupabaseClient, userId: string, tenantId: string) {
   const [member, tenant, account] = await Promise.all([
@@ -38,17 +41,24 @@ async function loadTenant(db: SupabaseClient, userId: string, tenantId: string) 
   }
 }
 
-async function createAccount(db: SupabaseClient, tenant: { id: string; name: string }, email: string | undefined) {
+async function createAccount(
+  db: SupabaseClient,
+  tenant: { id: string; name: string },
+  email: string | undefined,
+  country: string,
+) {
   const account = await stripe.v2.core.accounts.create(
     {
       display_name: tenant.name,
       contact_email: email,
+      identity: { country },
       dashboard: 'full',
       defaults: { responsibilities: { fees_collector: 'stripe', losses_collector: 'stripe' } },
       configuration: { merchant: { capabilities: { card_payments: { requested: true } } } },
       metadata: { tenant_id: tenant.id },
     },
-    { idempotencyKey: `connect-account-${tenant.id}` },
+    // Country is part of the key: retrying with a corrected country is a new request.
+    { idempotencyKey: `connect-account-${tenant.id}-${country}` },
   )
   // Returns the account already registered if another request won the race.
   const { data, error } = await db.rpc('register_connect_account', {
@@ -84,7 +94,12 @@ export default {
         return Response.json({ result })
       }
 
-      const accountId = existing ?? await createAccount(db, tenant, ctx.userClaims!.email)
+      let accountId = existing
+      if (!accountId) {
+        const country = typeof body?.country === 'string' ? body.country.toUpperCase() : ''
+        if (!COUNTRY_RE.test(country)) throw new HttpError(400, 'choose the country your business is based in')
+        accountId = await createAccount(db, tenant, ctx.userClaims!.email, country)
+      }
       const link = await stripe.v2.core.accountLinks.create({
         account: accountId,
         use_case: {

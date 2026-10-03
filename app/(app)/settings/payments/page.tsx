@@ -104,6 +104,7 @@ export default async function PaymentsPage({ searchParams }: { searchParams: Pro
               tenantId={active.id}
               label={!row ? "Connect Stripe" : row.status === "enabled" ? "Update details in Stripe" : "Finish setup in Stripe"}
               onboarding={onboarding === "return" || onboarding === "refresh" ? onboarding : undefined}
+              needsCountry={!row}
             />
           )}
         </div>
