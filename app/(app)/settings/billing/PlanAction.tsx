@@ -1,10 +1,9 @@
 "use client";
 
-import { FunctionsHttpError } from "@supabase/supabase-js";
 import { useRouter } from "next/navigation";
 import { useEffect, useState } from "react";
 import { formatDate, formatMoney } from "@/lib/billing/format";
-import { createClient } from "@/lib/supabase/client";
+import { callFunction } from "@/lib/supabase/call-function";
 
 type Preview =
   | { kind: "upgrade"; amount_due: number; currency: string; proration_date: number }
@@ -14,21 +13,6 @@ type Preview =
 type Outcome =
   | { status: "applied" | "scheduled" | "scheduled_change_canceled"; effective_at?: string }
   | { status: "requires_payment"; hosted_invoice_url: string | null; expires_at: string };
-
-type CallResult = { ok: true; data: Record<string, unknown> } | { ok: false; status: number; data: Record<string, unknown> };
-
-// The Edge Functions decide everything; this component only shows what they
-// return. The user's JWT is attached by the Supabase client.
-async function callFunction(name: string, body: Record<string, unknown>): Promise<CallResult> {
-  const { data, error } = await createClient().functions.invoke(name, { body });
-  if (!error) return { ok: true, data };
-  if (error instanceof FunctionsHttpError) {
-    const response = error.context as Response;
-    const payload = await response.json().catch(() => ({ error: "Something went wrong." }));
-    return { ok: false, status: response.status, data: payload };
-  }
-  return { ok: false, status: 0, data: { error: "Network error. Check your connection and try again." } };
-}
 
 const buttonStyles = {
   primary: "bg-[#0051d5] hover:bg-[#003ea8] text-white shadow-md",

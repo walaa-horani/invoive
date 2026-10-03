@@ -425,3 +425,15 @@ verify_jwt = false
 # Called by pg_cron with the secret key; checked via withSupabase({ auth: 'secret' }).
 [functions.reconcile-subscriptions]
 verify_jwt = false
+
+# Stripe Connect webhook: verified by its own signing secrets, not a JWT.
+[functions.stripe-connect-webhook]
+verify_jwt = false
+
+# Public pay page: the caller is whoever holds the invoice's pay link (token checked in the function).
+[functions.pay-invoice]
+verify_jwt = false
+
+# Called by pg_cron with the secret key; checked via withSupabase({ auth: 'secret' }).
+[functions.reconcile-invoice-payments]
+verify_jwt = false

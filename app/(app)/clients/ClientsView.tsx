@@ -191,6 +191,13 @@ export function ClientsView({
                     {canEdit && (
                       <div className="flex items-start justify-end gap-2">
                         {view === "active" && (
+                          <Link href={`/invoices/new?client=${c.id}`} className={secondaryButton}>
+                            <span aria-hidden className="material-symbols-outlined text-[18px]">receipt_long</span>
+                            <span className="hidden sm:inline">Invoice</span>
+                            <span className="sr-only sm:hidden">New invoice for {c.name}</span>
+                          </Link>
+                        )}
+                        {view === "active" && (
                           <ClientDialog
                             client={c}
                             triggerClassName={secondaryButton}

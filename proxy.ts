@@ -32,7 +32,7 @@ export async function proxy(request: NextRequest) {
   const { data } = await supabase.auth.getClaims();
 
   const { pathname } = request.nextUrl;
-  const isAppPage = ["/settings", "/clients"].some((p) => pathname === p || pathname.startsWith(`${p}/`));
+  const isAppPage = ["/settings", "/clients", "/invoices"].some((p) => pathname === p || pathname.startsWith(`${p}/`));
   if (!data?.claims && isAppPage) {
     const login = request.nextUrl.clone();
     login.pathname = "/login";
